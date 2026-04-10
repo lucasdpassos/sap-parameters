@@ -12,6 +12,7 @@ import anthropic
 from parser import load_instructions
 from actions import screenshot_b64, click, type_text, key_press, wait, keyboard_navigate_to
 from codemie_client import CodemieClient
+from minimax_client import MiniMaxClient
 
 # ──────────────────────────────────────────────
 # Logging
@@ -33,7 +34,6 @@ WAIT_AFTER_ACTION   = 1.0   # segundos de espera padrão após cada ação
 ANTHROPIC_MODEL  = "claude-opus-4-6"
 CODEMIE_MODEL    = "claude-sonnet-4-6"
 MINIMAX_MODEL    = "MiniMax-M2.7"
-MINIMAX_BASE_URL = "https://api.minimax.io/anthropic"
 
 # Ações que tipicamente precisam de mais tempo para o SAP responder
 SLOW_ACTIONS = {"click"}     # menus e janelas levam ~1s extra na primeira vez
@@ -308,9 +308,9 @@ def main():
         if not _api_key:
             log.error("MINIMAX_API_KEY not set. Export the variable before running.")
             sys.exit(1)
-        client = anthropic.Anthropic(api_key=_api_key, base_url=MINIMAX_BASE_URL)
+        client = MiniMaxClient(api_key=_api_key)
         model  = MINIMAX_MODEL
-        log.info(f"Backend: MiniMax ({model} via {MINIMAX_BASE_URL})")
+        log.info(f"Backend: MiniMax ({model} via OpenAI-compatible endpoint)")
 
     else:
         _api_key = os.environ.get("ANTHROPIC_API_KEY", "")
