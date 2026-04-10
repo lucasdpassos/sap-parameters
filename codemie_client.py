@@ -14,6 +14,8 @@ import logging
 import base64
 import requests
 
+from screen_context import build_context_from_b64
+
 log = logging.getLogger("sap-agent.codemie")
 
 # ── Configuração ────────────────────────────────────────────────────────────
@@ -164,21 +166,54 @@ class CodemieClient:
                                system: str, messages: list) -> str:
         """
         Usa /assistants/{id}/model — sem vision direta.
-        Injeta o system prompt e extrai apenas texto dos messages.
+        Substitui imagens por contexto textual rico gerado por
+        screen_context (OCR + OpenCV + xdotool).
         """
-        # Montar texto concatenado dos messages (sem imagens)
+        # Identificar qual é a última mensagem do usuário (screenshot mais recente)
+        last_user_idx = max(
+            (i for i, m in enumerate(messages) if m["role"] == "user"),
+            default=-1
+        )
+
         parts = [f"[SYSTEM]: {system}"] if system else []
-        for msg in messages:
+
+        for msg_idx, msg in enumerate(messages):
             role    = msg["role"].upper()
             content = msg["content"]
+            is_latest_user = (msg_idx == last_user_idx)
+
             if isinstance(content, str):
                 parts.append(f"[{role}]: {content}")
-            elif isinstance(content, list):
-                for block in content:
-                    if block.get("type") == "text":
-                        parts.append(f"[{role}]: {block['text']}")
-                    elif block.get("type") == "image":
-                        parts.append(f"[{role}]: [screenshot attached — vision not available in assistant mode]")
+                continue
+
+            text_parts  = []
+            image_parts = []
+            for block in content:
+                btype = block.get("type", "text")
+                if btype == "text":
+                    text_parts.append(block["text"])
+                elif btype == "image":
+                    src = block.get("source", {})
+                    if src.get("type") == "base64":
+                        image_parts.append((src["data"], src.get("media_type", "image/png")))
+
+            for b64_data, media_type in image_parts:
+                if is_latest_user:
+                    # Analisar o screenshot mais recente com OCR + OpenCV
+                    log.info("screen_context: analyzing latest screenshot...")
+                    try:
+                        ctx = build_context_from_b64(b64_data, media_type)
+                        text_parts.insert(0, ctx)
+                        log.info("screen_context: context built successfully")
+                    except Exception as e:
+                        log.warning(f"screen_context: failed ({e})")
+                        text_parts.insert(0, "[Screenshot analysis failed]")
+                else:
+                    # Histórico: omitir imagens antigas para economizar tokens
+                    text_parts.insert(0, "[previous screenshot — omitted from history]")
+
+            combined = "\n\n".join(text_parts)
+            parts.append(f"[{role}]: {combined}")
 
         text = "\n\n".join(parts)
         payload = {
@@ -214,9 +249,9 @@ class CodemieClient:
             else:
                 log.warning(f"Codemie: /chat/completions failed ({e}) — falling back to assistant endpoint")
 
-        # Fallback: assistant endpoint (sem vision)
-        log.warning("Codemie: ⚠ VISION UNAVAILABLE — operating without screenshot analysis")
-        log.warning("Codemie: To restore vision, reset your codemie_cli budget at codemie.lab.epam.com")
+        # Fallback: assistant endpoint com screen_context (OCR + OpenCV)
+        log.warning("Codemie: /chat/completions budget exceeded — using assistant + screen_context fallback")
+        log.info("Codemie: screenshots will be analyzed via OCR+OpenCV and injected as text context")
         log.info(f"Codemie: calling /assistants/{ASSISTANT_ID}/model model={model}")
         text = self._create_via_assistant(model, max_tokens, system, messages)
         log.info("Codemie: assistant endpoint OK")
