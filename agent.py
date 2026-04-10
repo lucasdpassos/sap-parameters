@@ -115,7 +115,17 @@ def ask_claude(client: anthropic.Anthropic, step: str, img_b64: str, history: li
         messages=messages,
     )
 
-    raw = response.content[0].text.strip()
+    # MiniMax (and extended-thinking models) may return a ThinkingBlock first;
+    # find the first block that actually has a text attribute.
+    text_block = next((b for b in response.content if hasattr(b, "text")), None)
+    if text_block is None:
+        log.warning("No text block in response content")
+        return {
+            "observation": "no text in response", "step_complete": False,
+            "action": {"type": "none"}, "reasoning": "no text block", "confidence": 0,
+            "progress": "no text block"
+        }
+    raw = text_block.text.strip()
     # Extract JSON even if wrapped in ```json ... ```
     if "```" in raw:
         raw = raw.split("```")[1]
