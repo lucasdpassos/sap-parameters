@@ -29,7 +29,11 @@ log = logging.getLogger("sap-agent")
 MAX_ACTIONS_PER_STEP = 15   # quantas ações sequenciais para completar 1 step
 MAX_STUCK_RETRIES   = 3     # quantas vezes pode repetir a MESMA ação sem progresso antes de desistir
 WAIT_AFTER_ACTION   = 1.0   # segundos de espera padrão após cada ação
-MODEL = "claude-opus-4-6"
+
+ANTHROPIC_MODEL  = "claude-opus-4-6"
+CODEMIE_MODEL    = "claude-sonnet-4-6"
+MINIMAX_MODEL    = "MiniMax-M2.7"
+MINIMAX_BASE_URL = "https://api.minimax.io/anthropic"
 
 # Ações que tipicamente precisam de mais tempo para o SAP responder
 SLOW_ACTIONS = {"click"}     # menus e janelas levam ~1s extra na primeira vez
@@ -77,7 +81,8 @@ Use lower values (0.3-0.5) for fast UI responses, higher (1.5-2.0) for dialogs/w
 If an element is not visible, set confidence < 0.5 and explain in observation."""
 
 
-def ask_claude(client: anthropic.Anthropic, step: str, img_b64: str, history: list) -> dict:
+def ask_claude(client: anthropic.Anthropic, step: str, img_b64: str, history: list,
+               model: str = ANTHROPIC_MODEL) -> dict:
     """Sends screenshot + step to Claude and returns the decision."""
     messages = history + [
         {
@@ -104,7 +109,7 @@ def ask_claude(client: anthropic.Anthropic, step: str, img_b64: str, history: li
     ]
 
     response = client.messages.create(
-        model=MODEL,
+        model=model,
         max_tokens=1024,
         system=SYSTEM_PROMPT,
         messages=messages,
@@ -188,7 +193,8 @@ def _action_signature(decision: dict) -> str:
     return t
 
 
-def run_step(client: anthropic.Anthropic, step: str, step_num: int) -> bool:
+def run_step(client: anthropic.Anthropic, step: str, step_num: int,
+             model: str = ANTHROPIC_MODEL) -> bool:
     """
     Runs a step with up to MAX_ACTIONS_PER_STEP sequential actions.
     Aborts early if stuck repeating the same action MAX_STUCK_RETRIES times.
@@ -211,7 +217,7 @@ def run_step(client: anthropic.Anthropic, step: str, step_num: int) -> bool:
 
         # 2. Ask Claude
         log.info("  → Consulting Claude Vision...")
-        decision = ask_claude(client, step, img_b64, history)
+        decision = ask_claude(client, step, img_b64, history, model=model)
 
         obs       = decision.get("observation", "")
         reasoning = decision.get("reasoning", "")
@@ -265,11 +271,16 @@ def run_step(client: anthropic.Anthropic, step: str, step_num: int) -> bool:
 
 def main():
     # ── Backend selection ──────────────────────────────────────────────────
-    use_codemie = "--codemie" in sys.argv
+    use_codemie  = "--codemie"  in sys.argv
+    use_minimax  = "--minimax"  in sys.argv
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
 
     if len(args) < 1:
-        print("Usage: python agent.py [--codemie] 'instruction or path/to/file.pdf'")
+        print("Usage: python agent.py [--codemie|--minimax] 'instruction or path/to/file.pdf'")
+        sys.exit(1)
+
+    if use_codemie and use_minimax:
+        log.error("Use only one of --codemie or --minimax")
         sys.exit(1)
 
     if use_codemie:
@@ -279,14 +290,26 @@ def main():
             log.error("Set CODEMIE_USERNAME and CODEMIE_PASSWORD to use --codemie")
             sys.exit(1)
         client = CodemieClient(username=username, password=password)
-        log.info("Backend: Codemie (claude-sonnet-4-6 via EPAM)")
+        model  = CODEMIE_MODEL
+        log.info(f"Backend: Codemie ({model} via EPAM)")
+
+    elif use_minimax:
+        _api_key = os.environ.get("MINIMAX_API_KEY", "")
+        if not _api_key:
+            log.error("MINIMAX_API_KEY not set. Export the variable before running.")
+            sys.exit(1)
+        client = anthropic.Anthropic(api_key=_api_key, base_url=MINIMAX_BASE_URL)
+        model  = MINIMAX_MODEL
+        log.info(f"Backend: MiniMax ({model} via {MINIMAX_BASE_URL})")
+
     else:
         _api_key = os.environ.get("ANTHROPIC_API_KEY", "")
         if not _api_key:
             log.error("ANTHROPIC_API_KEY not set. Export the variable before running.")
             sys.exit(1)
         client = anthropic.Anthropic(api_key=_api_key)
-        log.info("Backend: Anthropic API")
+        model  = ANTHROPIC_MODEL
+        log.info(f"Backend: Anthropic API ({model})")
 
     instruction_source = args[0]
     log.info(f"Loading instructions from: {instruction_source[:80]}")
@@ -308,7 +331,7 @@ def main():
     # Execute all steps
     results = []
     for i, step in enumerate(steps, 1):
-        ok = run_step(client, step, i)
+        ok = run_step(client, step, i, model=model)
         results.append((i, step, ok))
         if not ok:
             log.error(f"\nAborting — Step {i} failed.")
