@@ -11,6 +11,7 @@ import anthropic
 
 from parser import load_instructions
 from actions import screenshot_b64, click, type_text, key_press, wait
+from codemie_client import CodemieClient
 
 # ──────────────────────────────────────────────
 # Logging
@@ -252,24 +253,37 @@ def run_step(client: anthropic.Anthropic, step: str, step_num: int) -> bool:
 
 
 def main():
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        log.error("ANTHROPIC_API_KEY not set. Export the variable before running.")
+    # ── Backend selection ──────────────────────────────────────────────────
+    use_codemie = "--codemie" in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+
+    if len(args) < 1:
+        print("Usage: python agent.py [--codemie] 'instruction or path/to/file.pdf'")
         sys.exit(1)
 
-    if len(sys.argv) < 2:
-        print("Usage: python agent.py 'instruction or path/to/file.pdf'")
-        sys.exit(1)
+    if use_codemie:
+        username = os.environ.get("CODEMIE_USERNAME", "")
+        password = os.environ.get("CODEMIE_PASSWORD", "")
+        if not username or not password:
+            log.error("Set CODEMIE_USERNAME and CODEMIE_PASSWORD to use --codemie")
+            sys.exit(1)
+        client = CodemieClient(username=username, password=password)
+        log.info("Backend: Codemie (claude-sonnet-4-6 via EPAM)")
+    else:
+        _api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not _api_key:
+            log.error("ANTHROPIC_API_KEY not set. Export the variable before running.")
+            sys.exit(1)
+        client = anthropic.Anthropic(api_key=_api_key)
+        log.info("Backend: Anthropic API")
 
-    instruction_source = sys.argv[1]
+    instruction_source = args[0]
     log.info(f"Loading instructions from: {instruction_source[:80]}")
 
     steps = load_instructions(instruction_source)
     log.info(f"Steps identified: {len(steps)}")
     for i, s in enumerate(steps, 1):
         log.info(f"  {i}. {s}")
-
-    client = anthropic.Anthropic(api_key=api_key)
 
     # Initial screenshot to confirm SAP is visible
     log.info("\n--- Initial screenshot ---")
