@@ -10,7 +10,7 @@ import logging
 import anthropic
 
 from parser import load_instructions
-from actions import screenshot_b64, click, type_text, key_press, wait
+from actions import screenshot_b64, click, type_text, key_press, wait, keyboard_navigate_to
 from codemie_client import CodemieClient
 
 # ──────────────────────────────────────────────
@@ -68,6 +68,7 @@ Action types:
 - type: type the text in "text" field (field must already be focused)
 - key: press key named in "key" (e.g. Return, Tab, Escape, ctrl+s, alt+F10)
 - wait: wait "seconds" seconds (use only when animation/loading expected)
+- keyboard_navigate: after opening a menu/dropdown, use ↓ arrow keys to find and select an item by name. Set "text" to the item label to find (e.g. "Scripting..."). This is more reliable than clicking by coordinates for dropdown items.
 - none: nothing to do (step is already complete — set step_complete=true)
 
 The "wait_after" field overrides the default wait after this action (in seconds).
@@ -157,6 +158,14 @@ def execute_action(decision: dict) -> bool:
         wait(secs)
         return False  # skip the wait_after below since we already waited
 
+    elif atype == "keyboard_navigate":
+        target = action.get("text", "")
+        max_items = int(action.get("max_items", 12))
+        log.info(f"  → KEYBOARD_NAVIGATE to '{target}' (max {max_items} items)  [wait {wait_after}s]")
+        found = keyboard_navigate_to(target, max_items=max_items)
+        if not found:
+            log.warning(f"  ⚠ keyboard_navigate: '{target}' not found in menu")
+
     elif atype == "none":
         log.info("  → NO ACTION")
 
@@ -174,6 +183,8 @@ def _action_signature(decision: dict) -> str:
         return f"type:{a.get('text', '')[:30]}"
     if t == "key":
         return f"key:{a.get('key', '')}"
+    if t == "keyboard_navigate":
+        return f"keyboard_navigate:{a.get('text', '')[:30]}"
     return t
 
 

@@ -80,18 +80,201 @@ def _get_window_info() -> dict:
 # CAMADA 2 — OCR (pytesseract + OpenCV preprocessing)
 # ══════════════════════════════════════════════════════════════════════
 
-def _preprocess_for_ocr(img_bgr):
-    """Aplica preprocessing para melhorar OCR em UIs."""
+def _preprocess_for_ocr(img_bgr, scale: int = 3):
+    """
+    Aplica preprocessing para melhorar OCR em UIs.
+    scale=3 captura texto de 7-8px (dropdowns SAP) sem perder texto maior.
+    """
     import cv2
     import numpy as np
-    # Escala 2x para texto pequeno de UI
     h, w = img_bgr.shape[:2]
-    big = cv2.resize(img_bgr, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+    big  = cv2.resize(img_bgr, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
     gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
-    # Sharpen
-    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    sharp = cv2.filter2D(gray, -1, kernel)
-    return sharp, 2.0  # retorna imagem e scale factor
+    # OTSU binarization: melhor que sharpen simples para texto de UI
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binary, float(scale)
+
+
+def _detect_dropdown_regions(img_bgr) -> list[tuple]:
+    """
+    Detecta dropdowns/menus abertos por análise de blobs locais.
+    Estratégia: divide a imagem em colunas de 30px e procura faixas
+    horizontais com fundo claro E texto escuro local — ignora o fundo
+    branco geral da tela.
+    Retorna lista de (x, y, w, h).
+    """
+    import cv2
+    import numpy as np
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    ih, iw = gray.shape
+
+    STEP = 30       # largura de cada coluna de análise
+    MIN_TEXT = 3    # mínimo de pixels escuros por coluna para contar como "tem texto"
+    MIN_H    = 8    # altura mínima de região
+    MAX_H    = 250
+
+    # Para cada "strip" vertical de STEP pixels, encontrar faixas y com texto
+    col_segments: dict[int, list] = {}  # col_start → [(y_start, y_end)]
+
+    for x_start in range(0, iw - STEP, STEP):
+        strip = gray[:, x_start:x_start + STEP]
+        # Por linha: tem fundo claro (>190) e texto escuro (<100)?
+        row_has_light = strip.mean(axis=1) > 190
+        row_has_dark  = (strip < 100).sum(axis=1) >= MIN_TEXT
+        active = row_has_light & row_has_dark
+
+        # Agrupar linhas ativas em segmentos
+        in_seg = False
+        seg_start = 0
+        segs = []
+        for y in range(ih):
+            if active[y] and not in_seg:
+                in_seg = True
+                seg_start = y
+            elif not active[y] and in_seg:
+                in_seg = False
+                seg_len = y - seg_start
+                if MIN_H <= seg_len <= MAX_H:
+                    segs.append((seg_start, y))
+        if in_seg:
+            seg_len = ih - seg_start
+            if MIN_H <= seg_len <= MAX_H:
+                segs.append((seg_start, ih))
+        if segs:
+            col_segments[x_start] = segs
+
+    if not col_segments:
+        return []
+
+    # Mergear segmentos de colunas adjacentes que se sobrepõem
+    # Resultado: lista de (x0, y0, x1, y1) representando regiões
+    merged = []
+    for x_start, segs in sorted(col_segments.items()):
+        for (sy0, sy1) in segs:
+            placed = False
+            for m in merged:
+                # Sobreposição vertical com região existente
+                ov_start = max(m["y0"], sy0)
+                ov_end   = min(m["y1"], sy1)
+                if ov_end - ov_start >= MIN_H and abs(x_start - m["x1"]) <= STEP * 2:
+                    # Expandir região
+                    m["x1"] = max(m["x1"], x_start + STEP)
+                    m["y0"] = min(m["y0"], sy0)
+                    m["y1"] = max(m["y1"], sy1)
+                    placed = True
+                    break
+            if not placed:
+                merged.append({"x0": x_start, "y0": sy0, "x1": x_start + STEP, "y1": sy1})
+
+    # Converter para (x, y, w, h) e filtrar ruído
+    regions = []
+    for m in merged:
+        rw = m["x1"] - m["x0"]
+        rh = m["y1"] - m["y0"]
+        if rw >= 20 and rh >= MIN_H:
+            regions.append((m["x0"], m["y0"], rw, rh))
+
+    return regions
+
+
+def _ocr_small_region(img_bgr, x: int, y: int, w: int, h: int,
+                       padding: int = 4) -> list[dict]:
+    """
+    OCR de alta resolução (4x + OTSU) numa região específica.
+    Para regiões largas (w > 400), divide em fatias horizontais de 18px
+    e usa --psm 7 (single line) para melhor precisão em itens de menu.
+    """
+    try:
+        import cv2
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        return []
+
+    ih, iw = img_bgr.shape[:2]
+    x0 = max(0, x - padding)
+    y0 = max(0, y - padding)
+    x1 = min(iw, x + w + padding)
+    y1 = min(ih, y + h + padding)
+
+    # Regiões largas: escanear em fatias horizontais de 18px (sem recursão)
+    if (x1 - x0) > 400:
+        all_elements = []
+        SLICE_H = 18
+        for sy in range(y0, y1, SLICE_H):
+            sy_end = min(y1, sy + SLICE_H + 2)
+            crop_s = img_bgr[sy:sy_end, x0:x1]
+            if crop_s.size == 0:
+                continue
+            sc = 4
+            big_s  = cv2.resize(crop_s, (crop_s.shape[1]*sc, crop_s.shape[0]*sc),
+                                 interpolation=cv2.INTER_CUBIC)
+            gray_s = cv2.cvtColor(big_s, cv2.COLOR_BGR2GRAY)
+            _, bin_s = cv2.threshold(gray_s, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            try:
+                data_s = pytesseract.image_to_data(
+                    Image.fromarray(bin_s), lang="eng",
+                    config="--psm 7 --oem 3",
+                    output_type=pytesseract.Output.DICT,
+                )
+            except Exception:
+                continue
+            for i in range(len(data_s["text"])):
+                txt  = data_s["text"][i].strip()
+                conf = int(data_s["conf"][i])
+                if txt and conf > 20:
+                    ex  = x0 + int(data_s["left"][i]   / sc)
+                    ey  = sy  + int(data_s["top"][i]    / sc)
+                    ew  = int(data_s["width"][i]  / sc)
+                    eh  = int(data_s["height"][i] / sc)
+                    all_elements.append({
+                        "text": txt, "x": ex, "y": ey,
+                        "x1": ex+ew, "y1": ey+eh,
+                        "cx": ex + ew//2, "cy": ey + eh//2,
+                        "conf": conf, "source": "menu_ocr",
+                    })
+        return all_elements
+
+    crop = img_bgr[y0:y1, x0:x1]
+    if crop.size == 0:
+        return []
+
+    scale = 4
+    big  = cv2.resize(crop, (crop.shape[1]*scale, crop.shape[0]*scale),
+                      interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Para fatias finas (menu items), --psm 7 (single line) é mais preciso
+    crop_h = y1 - y0
+    psm = "7" if crop_h <= 22 else "6"
+
+    try:
+        data = pytesseract.image_to_data(
+            Image.fromarray(binary), lang="eng",
+            config=f"--psm {psm} --oem 3",
+            output_type=pytesseract.Output.DICT,
+        )
+    except Exception:
+        return []
+
+    elements = []
+    for i in range(len(data["text"])):
+        txt  = data["text"][i].strip()
+        conf = int(data["conf"][i])
+        if txt and conf > 20:
+            ex  = x0 + int(data["left"][i]   / scale)
+            ey  = y0 + int(data["top"][i]    / scale)
+            ew  = int(data["width"][i]  / scale)
+            eh  = int(data["height"][i] / scale)
+            ecx = ex + ew // 2
+            ecy = ey + eh // 2
+            elements.append({
+                "text": txt, "x": ex, "y": ey, "x1": ex + ew, "y1": ey + eh,
+                "cx": ecx, "cy": ecy, "conf": conf, "source": "menu_ocr",
+            })
+    return elements
 
 
 def _get_ocr_elements(img_bgr) -> list[dict]:
@@ -367,6 +550,8 @@ def build_context(screenshot_path: str) -> str:
     # ── Camada 2: OCR ───────────────────────────────────────────────
     ocr_elements = _get_ocr_elements(img)
 
+    # (grid_scan_menu_zone removed — keyboard navigation now handles menu items)
+
     # Menu bar (usa OCR nível palavra para melhor precisão)
     menu_items = _infer_menu_bar(img, win_info)
     if menu_items:
@@ -426,6 +611,98 @@ def build_context(screenshot_path: str) -> str:
     )
 
     return "\n".join(lines)
+
+
+def ocr_highlighted_item(screenshot_path: str) -> str | None:
+    """
+    Detecta o item de menu atualmente destacado (hover/selecionado via ↓↑).
+
+    Estratégia:
+      1. Converte para HSV e procura regiões com saturação alta (S > 60)
+         ou cor distinta do fundo branco/cinza — típico de seleção SAP.
+      2. Se não encontrar cor saturada, busca por inversão de cor (texto
+         branco em fundo escuro).
+      3. Faz OCR 4x na região destacada encontrada.
+      4. Retorna o texto OCR ou None se nada detectado.
+    """
+    try:
+        import cv2
+        import numpy as np
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        return None
+
+    img = cv2.imread(screenshot_path)
+    if img is None:
+        return None
+
+    ih, iw = img.shape[:2]
+    hsv   = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    # ── Máscara 1: saturação alta (azul SAP, verde, etc.) ─────────────
+    # H: qualquer, S > 60, V > 60  →  cor não-cinza
+    mask_color = cv2.inRange(hsv, (0, 60, 60), (180, 255, 255))
+
+    # ── Máscara 2: texto branco em fundo escuro (inversão de contraste) ──
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Região escura com texto claro: média local < 80
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (80, 16))
+    local_mean = cv2.blur(gray, (80, 16))
+    mask_dark = (local_mean < 100).astype(np.uint8) * 255
+
+    mask = cv2.bitwise_or(mask_color, mask_dark)
+
+    # Limpar ruído
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    best = None
+    best_area = 0
+
+    for cnt in contours:
+        rx, ry, rw, rh = cv2.boundingRect(cnt)
+        area = rw * rh
+        # Filtro: tamanho plausível para um item de menu (largura > 30, altura 8-40)
+        if rw < 30 or rh < 8 or rh > 50 or area < 300:
+            continue
+        # Preferir regiões na zona de menu (y < ih * 0.4)
+        score = area * (1.5 if ry < ih * 0.4 else 1.0)
+        if score > best_area:
+            best_area = score
+            best = (rx, ry, rw, rh)
+
+    if best is None:
+        return None
+
+    rx, ry, rw, rh = best
+    pad = 4
+    x0 = max(0, rx - pad)
+    y0 = max(0, ry - pad)
+    x1 = min(iw, rx + rw + pad)
+    y1 = min(ih, ry + rh + pad)
+    crop = img[y0:y1, x0:x1]
+
+    scale = 4
+    big  = cv2.resize(crop, (crop.shape[1]*scale, crop.shape[0]*scale),
+                      interpolation=cv2.INTER_CUBIC)
+    gray2 = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray2, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    try:
+        text = pytesseract.image_to_string(
+            Image.fromarray(binary),
+            config="--psm 7 --oem 3",
+        ).strip()
+    except Exception:
+        return None
+
+    # Limpar ruído OCR
+    text = re.sub(r"[^\w\s\.\-]", "", text).strip()
+    return text if len(text) >= 2 else None
 
 
 def build_context_from_b64(b64_data: str, media_type: str = "image/png") -> str:

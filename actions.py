@@ -4,9 +4,12 @@ actions.py — Funções de screenshot, clique, digitação e teclado via xdotoo
 import subprocess
 import time
 import os
+import re
 import base64
-import tempfile
+import logging
 from datetime import datetime
+
+log = logging.getLogger("sap-agent.actions")
 
 DISPLAY = os.environ.get("DISPLAY", ":1")
 
@@ -23,7 +26,6 @@ def screenshot(path: str | None = None) -> str:
         text=True,
     )
     if result.returncode != 0:
-        # fallback: import do ImageMagick
         result = subprocess.run(
             ["import", "-window", "root", path],
             env={**os.environ, "DISPLAY": DISPLAY},
@@ -81,3 +83,69 @@ def get_screen_size() -> tuple[int, int]:
     r = subprocess.run(["xdotool", "getdisplaygeometry"], env=env, capture_output=True, text=True)
     w, h = r.stdout.strip().split()
     return int(w), int(h)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Navegação de menus via teclado
+# ──────────────────────────────────────────────────────────────────
+
+def keyboard_navigate_to(target: str, max_items: int = 12,
+                          wait_s: float = 0.35) -> bool:
+    """
+    Navega por um menu/dropdown aberto usando ↓ até encontrar o item alvo.
+
+    Estratégia:
+      1. Pressiona ↓ para destacar o primeiro item.
+      2. Tira screenshot e roda OCR na região destacada (colorida).
+      3. Se o texto destacado bate com `target`, pressiona Enter e retorna True.
+      4. Repete até `max_items` vezes. Se não encontrar, Escape + retorna False.
+
+    `target` é comparado em lowercase sem espaços extras (fuzzy match).
+    """
+    from screen_context import ocr_highlighted_item
+
+    target_clean = _clean(target)
+    log.info(f"keyboard_navigate_to: procurando '{target}' (max {max_items} itens)")
+
+    for i in range(1, max_items + 1):
+        key_press("Down")
+        time.sleep(wait_s)
+
+        img_path = screenshot()
+        highlighted = ocr_highlighted_item(img_path)
+
+        if highlighted:
+            log.info(f"  ↓ item {i}: '{highlighted}'")
+            if _fuzzy_match(target_clean, _clean(highlighted)):
+                log.info(f"  ✓ Encontrado! Pressionando Enter.")
+                key_press("Return")
+                time.sleep(0.5)
+                return True
+        else:
+            log.debug(f"  ↓ item {i}: (sem highlight detectado)")
+
+    log.warning(f"  ✗ '{target}' não encontrado em {max_items} itens. Fechando menu.")
+    key_press("Escape")
+    return False
+
+
+def _clean(text: str) -> str:
+    """Normaliza texto para comparação fuzzy."""
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _fuzzy_match(a: str, b: str) -> bool:
+    """True se `a` está contido em `b` ou vice-versa (substring match)."""
+    return a in b or b in a or _lcs_ratio(a, b) > 0.7
+
+
+def _lcs_ratio(a: str, b: str) -> float:
+    """Proporção do LCS em relação ao menor string."""
+    if not a or not b:
+        return 0.0
+    m, n = len(a), len(b)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            dp[i][j] = dp[i-1][j-1] + 1 if a[i-1] == b[j-1] else max(dp[i-1][j], dp[i][j-1])
+    return dp[m][n] / min(m, n)
